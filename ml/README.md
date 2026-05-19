@@ -2,6 +2,9 @@
 
 > **한국 DART 데이터 기반 LSTM + GraphSAGE 통합 모델**
 > 시계열 재무 패턴과 기업 간 관계망을 결합한 파산 예측 시스템
+>
+> https://drive.google.com/file/d/1BbXufespOSQV6qzLG__A8j-MjQr40Eap/view?usp=sharing
+데이터배이스 다운로드
 
 ---
 
