@@ -1,0 +1,208 @@
+"""
+2단계: 상장폐지 현황 → bankruptcy 테이블 INSERT
+실행: python insert_bankruptcy.py
+
+필요 파일: 상장폐지현황.xls (한국거래소에서 다운로드한 파일)
+출력:      bankruptcy_prediction.db의 bankruptcy 테이블
+"""
+
+import sqlite3
+import pandas as pd
+
+DB_PATH = "db/bankruptcy_prediction.db"
+XLS_PATH = "상장폐지현황 (1).xlsx"   # 파일 경로 본인 환경에 맞게 수정
+
+
+# ── 1. 파일 읽기 ─────────────────────────────────────────────────────
+def load_delist_file(path):
+    df = pd.read_excel(path)
+    df.columns = ['번호', '회사명', '종목코드', '폐지일자', '폐지사유', '비고']
+    df['폐지일자'] = pd.to_datetime(df['폐지일자'], errors='coerce')
+    df['연도'] = df['폐지일자'].dt.year
+    print(f"파일 로드 완료: {len(df)}건")
+    return df
+
+
+# ── 2. 파산 여부 판단 ────────────────────────────────────────────────
+# 실질 부도로 볼 수 있는 키워드
+BANKRUPT_KEYWORDS = [
+    '감사의견 거절', '의견거절', '감사의견거절',
+    '감사범위 제한', '감사범위제한',
+    '계속기업',
+    '파산', '회생',
+    '자본잠식', '자본전액잠식',
+    '사업보고서', '반기보고서', '분기보고서',
+    '해산사유 발생',
+    '기업의 계속성',   # 종합적 상폐결정
+]
+
+# 파산이 아닌 케이스 (명확히 제외)
+EXCLUDE_KEYWORDS = [
+    '피흡수합병', '스팩소멸합병',
+    '합병',
+    '자진', '신청에 의한', '상장폐지 신청',
+    '이전상장', '코스닥시장 이전', '유가증권시장',
+    '완전자회사',
+]
+
+
+def categorize_reason(reason):
+    """폐지사유를 카테고리로 분류"""
+    if pd.isna(reason):
+        return None, False
+
+    reason = str(reason)
+
+    # 제외 키워드 먼저 확인
+    if any(k in reason for k in EXCLUDE_KEYWORDS):
+        return '비파산', False
+
+    # 파산 카테고리 분류
+    if '파산' in reason:
+        return '파산선고', True
+    if '회생' in reason:
+        return '회생절차개시', True
+    if '자본전액잠식' in reason:
+        return '자본전액잠식', True
+    if '자본잠식' in reason:
+        return '자본잠식', True
+    if '계속기업' in reason:
+        return '계속기업불확실', True
+    if any(k in reason for k in ['감사의견 거절', '의견거절', '감사의견거절']):
+        return '감사의견거절', True
+    if '감사범위' in reason:
+        return '감사범위제한', True
+    if any(k in reason for k in ['사업보고서', '반기보고서', '분기보고서']):
+        return '보고서미제출', True
+    if '해산' in reason:
+        return '해산', True
+    if '기업의 계속성' in reason:
+        return '종합적상폐결정', True
+
+    return '기타', False
+
+
+# ── 3. 데이터 정제 ───────────────────────────────────────────────────
+def preprocess(df):
+    """파산 여부 분류 및 필터링"""
+
+    # 카테고리 및 파산 여부 적용
+    results = df['폐지사유'].apply(categorize_reason)
+    df['reason_category'] = [r[0] for r in results]
+    df['is_bankrupt'] = [r[1] for r in results]
+
+    # 파산 기업만 필터링
+    bankrupt = df[df['is_bankrupt']].copy()
+
+    # 중복 종목코드 처리 (재상장 후 재폐지 케이스)
+    # → 가장 최근 폐지 기록만 유지
+    bankrupt = (bankrupt
+                .sort_values('폐지일자', ascending=False)
+                .drop_duplicates('종목코드', keep='first'))
+
+    print(f"\n파산 기업 분류 결과:")
+    print(bankrupt['reason_category'].value_counts().to_string())
+    print(f"\n총 파산 기업: {len(bankrupt)}건")
+
+    return bankrupt
+
+
+# ── 4. DB INSERT ─────────────────────────────────────────────────────
+def insert_to_db(bankrupt_df):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    inserted, skipped = 0, 0
+
+    for _, row in bankrupt_df.iterrows():
+        # 종목코드로 corp_code 조회 (companies 테이블에 있으면)
+        cur.execute("""
+            SELECT corp_code FROM companies
+            WHERE stock_code = ?
+        """, (str(row['종목코드']).zfill(6),))
+        result = cur.fetchone()
+        corp_code = result[0] if result else None
+
+        try:
+            cur.execute("""
+                INSERT OR IGNORE INTO bankruptcy
+                (corp_code, stock_code, corp_name,
+                 delist_date, delist_reason, reason_category, label)
+                VALUES (?, ?, ?, ?, ?, ?, 1)
+            """, (
+                corp_code,
+                str(row['종목코드']).zfill(6),
+                row['회사명'],
+                row['폐지일자'].strftime('%Y-%m-%d') if pd.notna(row['폐지일자']) else None,
+                row['폐지사유'],
+                row['reason_category'],
+            ))
+            inserted += 1
+        except Exception as e:
+            print(f"  INSERT 실패: {row['회사명']} — {e}")
+            skipped += 1
+
+    conn.commit()
+
+    # 결과 확인
+    cur.execute("SELECT COUNT(*) FROM bankruptcy")
+    total = cur.fetchone()[0]
+
+    cur.execute("""
+        SELECT reason_category, COUNT(*) as cnt
+        FROM bankruptcy
+        GROUP BY reason_category
+        ORDER BY cnt DESC
+    """)
+    category_counts = cur.fetchall()
+
+    conn.close()
+
+    print(f"\n=== INSERT 완료 ===")
+    print(f"  삽입: {inserted}건 / 스킵: {skipped}건")
+    print(f"  bankruptcy 테이블 총 {total}건")
+    print(f"\n=== 카테고리별 분포 ===")
+    for cat, cnt in category_counts:
+        print(f"  {cat:<20} {cnt}건")
+
+
+# ── 5. 연도별 분포 확인 ──────────────────────────────────────────────
+def check_yearly_distribution():
+    conn = sqlite3.connect(DB_PATH)
+
+    df = pd.read_sql("""
+        SELECT
+            SUBSTR(delist_date, 1, 4) AS year,
+            COUNT(*) AS cnt
+        FROM bankruptcy
+        GROUP BY year
+        ORDER BY year
+    """, conn)
+
+    conn.close()
+
+    print("\n=== 연도별 파산 기업 수 ===")
+    print(df.to_string(index=False))
+    print(f"\n학습 활용 가능 (2010~2023): "
+          f"{df[df['year'].between('2010','2023')]['cnt'].sum()}건")
+
+
+# ── 메인 ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 50)
+    print("2단계: 파산 레이블 구성")
+    print("=" * 50)
+
+    # 파일 로드
+    df = load_delist_file(XLS_PATH)
+
+    # 전처리 및 분류
+    bankrupt_df = preprocess(df)
+
+    # DB INSERT
+    insert_to_db(bankrupt_df)
+
+    # 연도별 분포 확인
+    check_yearly_distribution()
+
+    print("\n완료. 다음 단계: DART API로 기업 목록 수집 (03_collect_companies.py)")

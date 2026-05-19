@@ -1,0 +1,363 @@
+"""
+파산 예측 대시보드
+실행: streamlit run dashboard.py
+필요: pip install streamlit plotly
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import sqlite3
+import json, os
+import plotly.express as px
+import plotly.graph_objects as go
+from predictor import Predictor, calc_interest_rate, calc_loan_limit, calc_expected_loss
+
+DB_PATH = "bankruptcy_prediction.db"
+
+st.set_page_config(
+    page_title="기업 파산 예측 시스템",
+    page_icon="📊",
+    layout="wide"
+)
+
+
+# ── 데이터 / 모델 로드 ────────────────────────────────────────────────
+@st.cache_resource
+def get_predictor():
+    return Predictor()
+
+
+@st.cache_data
+def load_companies():
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql("""
+        SELECT c.corp_code, c.corp_name, c.market, c.industry_code,
+               CASE WHEN b.corp_code IS NOT NULL THEN 1 ELSE 0 END as is_bankrupt
+        FROM companies c
+        LEFT JOIN bankruptcy b ON c.corp_code = b.corp_code
+        WHERE c.market IN ('K', 'Y')
+        ORDER BY c.corp_name
+    """, conn)
+    conn.close()
+    return df
+
+
+@st.cache_data
+def load_financial_sequence(corp_code, feature_cols):
+    """기업의 시계열 재무 데이터 로드"""
+    conn = sqlite3.connect(DB_PATH)
+
+    # financials 테이블에 있는 컬럼만 추출
+    fin_cols = ['debt_ratio', 'current_ratio', 'interest_coverage',
+                'net_debt_ratio', 'equity_ratio',
+                'roa', 'roe', 'op_margin', 'net_margin',
+                'cfo_to_debt', 'fcf',
+                'revenue_growth', 'op_income_growth', 'asset_growth',
+                'interest_cov_yoy', 'debt_ratio_trend', 'cf_volatility',
+                'consecutive_loss', 'z_score']
+    selected_fin = [c for c in feature_cols if c in fin_cols]
+
+    cols = ', '.join(selected_fin)
+    df = pd.read_sql(f"""
+        SELECT year, {cols},
+               total_assets, operating_cf
+        FROM financials
+        WHERE corp_code = ?
+        ORDER BY year
+    """, conn, params=(corp_code,))
+
+    # 뉴스 피처는 기업 평균으로 결합
+    news_df = pd.read_sql("""
+        SELECT AVG(sentiment_avg) as sentiment_avg,
+               AVG(negative_ratio) as negative_ratio,
+               SUM(news_count) as news_count,
+               MAX(news_bankruptcy_flag) as news_bankruptcy_flag,
+               MAX(news_lawsuit_flag) as news_lawsuit_flag
+        FROM news_sentiment
+        WHERE corp_code = ?
+    """, conn, params=(corp_code,))
+
+    conn.close()
+
+    # 뉴스 피처를 모든 연도에 동일하게 부여
+    news_cols = ['sentiment_avg', 'negative_ratio', 'news_count',
+                 'news_bankruptcy_flag', 'news_lawsuit_flag']
+    for col in news_cols:
+        if col in feature_cols:
+            df[col] = news_df[col].iloc[0] if len(news_df) > 0 else 0
+            df[col] = df[col].fillna(0)
+
+    return df
+
+
+# ── 사이드바: 모델 선택 ──────────────────────────────────────────────
+st.sidebar.title("⚙️ 모델 설정")
+
+predictor = get_predictor()
+available_models = predictor.list_models()
+model_names = [m['model_name'] for m in available_models]
+
+if not model_names:
+    st.sidebar.error("학습된 모델이 없습니다. train_all_models.py를 먼저 실행하세요.")
+    st.stop()
+
+selected_model = st.sidebar.selectbox(
+    "예측 모델 선택",
+    model_names,
+    index=model_names.index(predictor.active_name) if predictor.active_name in model_names else 0
+)
+
+# 현재 모델 정보
+current_meta = next((m for m in available_models if m['model_name'] == selected_model), None)
+if current_meta:
+    custom_thr = st.sidebar.slider(
+        "Threshold 조정",
+        min_value=0.0, max_value=1.0,
+        value=float(current_meta['threshold']),
+        step=0.01,
+        help="파산 분류 기준값"
+    )
+    if st.sidebar.button("모델 적용"):
+        predictor.set_active(selected_model, custom_thr)
+        st.cache_resource.clear()
+        st.rerun()
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**현재 모델 성능**")
+    st.sidebar.metric("ROC-AUC",  f"{current_meta['roc_auc']:.4f}")
+    st.sidebar.metric("PR-AUC",   f"{current_meta['pr_auc']:.4f}")
+    st.sidebar.metric("F1-Score", f"{current_meta['f1']:.4f}")
+
+
+# ── 메인 ─────────────────────────────────────────────────────────────
+st.title("📊 기업 파산 예측 기반 대출 심사 시스템")
+st.caption(f"활성 모델: **{predictor.active_name.upper()}**  |  Threshold: **{predictor.meta['threshold']:.3f}**")
+
+tab1, tab2, tab3 = st.tabs(["기업 조회", "모델 비교", "포트폴리오"])
+
+
+# ── 탭 1: 기업 조회 ───────────────────────────────────────────────────
+with tab1:
+    companies = load_companies()
+
+    col1, col2 = st.columns([2, 1])
+
+    with col1:
+        company_name = st.selectbox(
+            "기업 선택",
+            companies['corp_name'].tolist(),
+            help=f"전체 {len(companies)}개 기업"
+        )
+
+    selected = companies[companies['corp_name'] == company_name].iloc[0]
+    corp_code = selected['corp_code']
+
+    # 재무 데이터 로드
+    feature_cols = predictor.meta['feature_cols']
+    fin_df = load_financial_sequence(corp_code, feature_cols)
+
+    if len(fin_df) == 0:
+        st.warning("재무 데이터가 없는 기업입니다.")
+    else:
+        # 시퀀스 구성
+        seq_len = predictor.meta['seq_len']
+        feats = fin_df[feature_cols].fillna(0).values.astype(np.float32)
+
+        if len(feats) >= seq_len:
+            sequence = feats[-seq_len:]
+        else:
+            pad = np.zeros((seq_len - len(feats), len(feature_cols)), dtype=np.float32)
+            sequence = np.vstack([pad, feats])
+
+        # 예측
+        result = predictor.predict(sequence)
+        pd_score = result['probability']
+
+        # ── 결과 표시 ──
+        st.markdown("---")
+
+        col1, col2, col3, col4 = st.columns(4)
+
+        with col1:
+            color = "🔴" if pd_score >= predictor.meta['threshold'] else "🟢"
+            st.metric(f"{color} 파산 확률 (PD)", f"{pd_score*100:.1f}%")
+
+        with col2:
+            risk = "위험" if pd_score >= 0.5 else "주의" if pd_score >= 0.2 else "안전"
+            st.metric("위험 등급", risk)
+
+        with col3:
+            st.metric("실제 레이블",
+                      "파산" if selected['is_bankrupt'] else "정상")
+
+        with col4:
+            st.metric("시장",
+                      "코스피" if selected['market'] == 'Y' else "코스닥")
+
+        st.markdown("---")
+
+        # 대출 심사
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            st.subheader("📋 대출 심사 조건")
+            loan_amount = st.number_input("신청 금액 (억원)", 1.0, 1000.0, 100.0, 1.0)
+            industry_risk = st.selectbox("업종 리스크", ["low", "medium", "high"], index=1)
+            has_collateral = st.checkbox("담보 제공", value=False)
+            collateral_value = 0.0
+            if has_collateral:
+                collateral_value = st.number_input("담보 가치 (억원)", 0.0, 1000.0, 50.0, 1.0)
+
+        with col_right:
+            st.subheader("💰 심사 결과")
+
+            # 금리
+            rate = calc_interest_rate(pd_score, industry_risk, has_collateral)
+            if rate is None:
+                st.error("⛔ 대출 거절 (PD 50% 초과)")
+            else:
+                st.success(f"승인 가능")
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.metric("적정 금리", f"{rate*100:.2f}%")
+
+                # 한도
+                latest = fin_df.iloc[-1]
+                limit = calc_loan_limit(
+                    operating_cf=latest.get('operating_cf', 100),
+                    total_assets=latest.get('total_assets', 1000),
+                    pd_score=pd_score,
+                    collateral_value=collateral_value
+                )
+                with col_b:
+                    st.metric("권장 한도", f"{limit:.1f} 억")
+
+                # Expected Loss
+                el = calc_expected_loss(pd_score, loan_amount)
+                st.metric("Expected Loss", f"{el:.2f} 억",
+                          delta=f"-{(el/loan_amount*100):.1f}%",
+                          delta_color="inverse")
+
+        # 재무 시계열 차트
+        st.markdown("---")
+        st.subheader("📈 재무 지표 추이")
+
+        chart_cols = ['debt_ratio', 'roa', 'z_score', 'interest_coverage']
+        available_chart_cols = [c for c in chart_cols if c in fin_df.columns]
+
+        if available_chart_cols and 'year' in fin_df.columns:
+            chart_df = fin_df[['year'] + available_chart_cols].melt(
+                id_vars='year', var_name='지표', value_name='값'
+            )
+            fig = px.line(chart_df, x='year', y='값', color='지표',
+                          markers=True, height=400)
+            fig.update_layout(hovermode='x unified')
+            st.plotly_chart(fig, use_container_width=True)
+
+
+# ── 탭 2: 모델 비교 ───────────────────────────────────────────────────
+with tab2:
+    st.subheader("🔬 모델 성능 비교 (Ablation Study)")
+
+    if available_models:
+        comp_df = pd.DataFrame(available_models)
+        comp_df = comp_df[['model_name', 'roc_auc', 'pr_auc', 'f1', 'threshold']]
+        comp_df.columns = ['모델', 'ROC-AUC', 'PR-AUC', 'F1', 'Threshold']
+        comp_df = comp_df.round(4)
+
+        st.dataframe(comp_df, use_container_width=True, hide_index=True)
+
+        # 시각화
+        col1, col2 = st.columns(2)
+
+        with col1:
+            fig = go.Figure()
+            for metric in ['ROC-AUC', 'PR-AUC', 'F1']:
+                fig.add_trace(go.Bar(name=metric, x=comp_df['모델'], y=comp_df[metric]))
+            fig.update_layout(barmode='group', title="성능 지표 비교", height=400)
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            fig = px.bar(comp_df, x='모델', y='Threshold',
+                         title="모델별 최적 Threshold",
+                         color='Threshold',
+                         color_continuous_scale='Reds')
+            fig.update_layout(height=400, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.info(f"""
+        💡 **현재 활성 모델: {predictor.active_name.upper()}**
+
+        - Threshold가 낮을수록 모델이 파산을 보수적으로 예측한다는 의미입니다.
+        - PR-AUC가 불균형 데이터에서 가장 신뢰할 수 있는 지표입니다.
+        """)
+
+
+# ── 탭 3: 포트폴리오 ──────────────────────────────────────────────────
+with tab3:
+    st.subheader("📦 포트폴리오 리스크 분석")
+
+    companies = load_companies()
+
+    selected_corps = st.multiselect(
+        "분석할 기업 선택 (여러 개 가능)",
+        companies['corp_name'].tolist(),
+        help="여러 기업을 선택하면 포트폴리오 전체 리스크를 계산합니다"
+    )
+
+    if selected_corps:
+        feature_cols = predictor.meta['feature_cols']
+        seq_len      = predictor.meta['seq_len']
+
+        results = []
+        for name in selected_corps:
+            corp_code = companies[companies['corp_name'] == name]['corp_code'].iloc[0]
+            fin_df    = load_financial_sequence(corp_code, feature_cols)
+
+            if len(fin_df) == 0:
+                continue
+
+            feats = fin_df[feature_cols].fillna(0).values.astype(np.float32)
+            if len(feats) >= seq_len:
+                sequence = feats[-seq_len:]
+            else:
+                pad = np.zeros((seq_len - len(feats), len(feature_cols)), dtype=np.float32)
+                sequence = np.vstack([pad, feats])
+
+            pred = predictor.predict(sequence)
+            results.append({
+                '기업명':    name,
+                'PD (%)':    round(pred['probability'] * 100, 2),
+                '위험등급':  '위험' if pred['probability'] >= 0.5 else ('주의' if pred['probability'] >= 0.2 else '안전'),
+                '예측':      '파산' if pred['label'] == 1 else '정상',
+            })
+
+        if results:
+            result_df = pd.DataFrame(results).sort_values('PD (%)', ascending=False)
+            st.dataframe(result_df, use_container_width=True, hide_index=True)
+
+            # 통계
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("평균 PD", f"{result_df['PD (%)'].mean():.2f}%")
+            with col2:
+                high_risk = (result_df['PD (%)'] >= 50).sum()
+                st.metric("고위험 기업 수", high_risk)
+            with col3:
+                st.metric("총 기업 수", len(result_df))
+
+            # 분포 차트
+            fig = px.histogram(result_df, x='PD (%)', nbins=20,
+                               title="포트폴리오 PD 분포",
+                               color_discrete_sequence=['#FF6B6B'])
+            fig.add_vline(x=20, line_dash="dash", line_color="orange",
+                          annotation_text="주의 임계값")
+            fig.add_vline(x=50, line_dash="dash", line_color="red",
+                          annotation_text="위험 임계값")
+            st.plotly_chart(fig, use_container_width=True)
+
+
+# ── 푸터 ─────────────────────────────────────────────────────────────
+st.markdown("---")
+st.caption("기업 파산 예측 시스템 | LSTM + GraphSAGE 통합 모델")

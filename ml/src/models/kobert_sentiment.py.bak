@@ -1,0 +1,306 @@
+"""
+KoBERT 기반 뉴스 감성 분석
+실행: python kobert_sentiment.py
+
+설치 필요:
+  pip install transformers torch sentencepiece
+
+처리 흐름:
+  news_raw 테이블 → KoBERT 감성 분석 → news_sentiment 테이블
+  중단 후 재실행하면 이어서 처리
+"""
+
+import sqlite3
+import torch
+import time
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from torch.nn.functional import softmax
+
+DB_PATH    = "bankruptcy_prediction.db"
+BATCH_SIZE = 32   # 한 번에 처리할 뉴스 수 (GPU 있으면 64로 늘려도 됨)
+MAX_LEN    = 128  # 토큰 최대 길이
+
+# ── 모델 로드 ─────────────────────────────────────────────────────────
+def load_model():
+    """
+    klue/roberta-base 기반 감성 분석 모델
+    snunlp/KR-FinBert-SC: 금융 특화 감성 분석
+    → 긍정/부정/중립 3클래스 분류
+    """
+    print("모델 로드 중...")
+    model_name = "snunlp/KR-FinBert-SC"
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model     = AutoModelForSequenceClassification.from_pretrained(model_name)
+        print(f"모델 로드 완료: {model_name}")
+    except Exception:
+        # 금융 특화 모델 없으면 일반 한국어 감성 모델 사용
+        print("금융 모델 로드 실패 → 일반 한국어 감성 모델 사용")
+        model_name = "snunlp/KR-ELECTRA-discriminator"
+        tokenizer  = AutoTokenizer.from_pretrained("monologg/koelectra-base-finetuned-sentiment")
+        model      = AutoModelForSequenceClassification.from_pretrained("monologg/koelectra-base-finetuned-sentiment")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model  = model.to(device)
+    model.eval()
+
+    print(f"디바이스: {device}")
+    return tokenizer, model, device
+
+
+# ── DB 초기화 ─────────────────────────────────────────────────────────
+def init_sentiment_table():
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+
+    # 뉴스별 감성 점수 테이블
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS news_sentiment_raw (
+            rowid_ref    INTEGER PRIMARY KEY,
+            corp_code    TEXT,
+            pub_date     TEXT,
+            positive     REAL,
+            negative     REAL,
+            neutral      REAL,
+            sentiment    TEXT,
+            processed_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+    # 기업별 월별 집계 테이블 (LSTM 입력용)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS news_sentiment (
+            corp_code              TEXT,
+            year                   INTEGER,
+            month                  INTEGER,
+            news_count             INTEGER,
+            sentiment_avg          REAL,
+            negative_ratio         REAL,
+            positive_ratio         REAL,
+            news_bankruptcy_flag   INTEGER DEFAULT 0,
+            news_lawsuit_flag      INTEGER DEFAULT 0,
+            news_ceo_change_flag   INTEGER DEFAULT 0,
+            PRIMARY KEY (corp_code, year, month)
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+    print("감성 분석 테이블 초기화 완료")
+
+
+# ── 이미 처리된 항목 확인 ────────────────────────────────────────────
+def get_processed_ids():
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+    cur.execute("SELECT rowid_ref FROM news_sentiment_raw")
+    done = set(r[0] for r in cur.fetchall())
+    conn.close()
+    return done
+
+
+# ── 감성 분석 (배치 처리) ────────────────────────────────────────────
+def analyze_batch(texts, tokenizer, model, device):
+    inputs = tokenizer(
+        texts,
+        return_tensors="pt",
+        truncation=True,
+        padding=True,
+        max_length=MAX_LEN
+    ).to(device)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+        probs   = softmax(outputs.logits, dim=-1).cpu().numpy()
+
+    # 모델 레이블: 0=부정, 1=중립, 2=긍정 (모델마다 다를 수 있음)
+    results = []
+    for prob in probs:
+        if len(prob) == 3:
+            negative, neutral, positive = prob[0], prob[1], prob[2]
+        else:
+            negative, positive = prob[0], prob[1]
+            neutral = 0.0
+
+        sentiment = "positive" if positive > 0.5 else \
+                    "negative" if negative > 0.5 else "neutral"
+
+        results.append({
+            "positive":  float(positive),
+            "negative":  float(negative),
+            "neutral":   float(neutral),
+            "sentiment": sentiment
+        })
+    return results
+
+
+# ── 키워드 플래그 ────────────────────────────────────────────────────
+BANKRUPTCY_KEYWORDS = ["파산", "법정관리", "워크아웃", "회생", "부도", "자본잠식", "상장폐지"]
+LAWSUIT_KEYWORDS    = ["소송", "고소", "분쟁", "소제기", "법적", "고발"]
+CEO_KEYWORDS        = ["대표이사", "대표 교체", "CEO 교체", "대표 사임", "경영진 교체"]
+
+def get_flags(text):
+    text = text or ""
+    return {
+        "bankruptcy": int(any(k in text for k in BANKRUPTCY_KEYWORDS)),
+        "lawsuit":    int(any(k in text for k in LAWSUIT_KEYWORDS)),
+        "ceo_change": int(any(k in text for k in CEO_KEYWORDS)),
+    }
+
+
+# ── 메인 처리 루프 ────────────────────────────────────────────────────
+def process():
+    init_sentiment_table()
+    tokenizer, model, device = load_model()
+
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+
+    # 전체 뉴스 수
+    total = conn.execute("SELECT COUNT(*) FROM news_raw").fetchone()[0]
+    processed_ids = get_processed_ids()
+
+    print(f"전체 뉴스: {total}건")
+    print(f"이미 처리: {len(processed_ids)}건")
+    print(f"남은 건수: {total - len(processed_ids)}건\n")
+
+    # 미처리 뉴스 로드
+    rows = conn.execute("""
+        SELECT rowid, corp_code, title, description, pub_date
+        FROM news_raw
+        ORDER BY rowid
+    """).fetchall()
+
+    todo = [(r[0], r[1], r[2], r[3], r[4])
+            for r in rows if r[0] not in processed_ids]
+
+    print(f"처리 시작: {len(todo)}건 / 배치 크기: {BATCH_SIZE}")
+
+    start_time = time.time()
+    processed  = 0
+
+    for i in range(0, len(todo), BATCH_SIZE):
+        batch = todo[i:i + BATCH_SIZE]
+
+        rowids     = [b[0] for b in batch]
+        corp_codes = [b[1] for b in batch]
+        texts      = [f"{b[2]} {b[3]}" for b in batch]  # 제목 + 본문 합치기
+        pub_dates  = [b[4] for b in batch]
+
+        # 감성 분석
+        try:
+            results = analyze_batch(texts, tokenizer, model, device)
+        except Exception as e:
+            print(f"배치 처리 실패: {e}")
+            continue
+
+        # DB 저장
+        for j, (rowid, corp_code, pub_date, result) in enumerate(
+                zip(rowids, corp_codes, pub_dates, results)):
+
+            flags = get_flags(texts[j])
+
+            cur.execute("""
+                INSERT OR IGNORE INTO news_sentiment_raw
+                (rowid_ref, corp_code, pub_date,
+                 positive, negative, neutral, sentiment)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                rowid, corp_code, pub_date,
+                result["positive"], result["negative"],
+                result["neutral"],  result["sentiment"]
+            ))
+
+        conn.commit()
+        processed += len(batch)
+
+        # 진행 상황 출력 (500건마다)
+        if processed % 500 == 0:
+            elapsed = time.time() - start_time
+            eta     = elapsed / processed * (len(todo) - processed)
+            print(f"[{processed}/{len(todo)}] "
+                  f"경과: {elapsed/3600:.1f}시간 / "
+                  f"예상 남은 시간: {eta/3600:.1f}시간")
+
+    conn.close()
+    print(f"\n감성 분석 완료: {processed}건")
+    print("다음 단계: 월별 집계 실행")
+
+
+# ── 월별 집계 (LSTM 입력용 피처 생성) ───────────────────────────────
+def aggregate():
+    """
+    news_sentiment_raw → news_sentiment (기업별 월별 집계)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+
+    print("월별 집계 중...")
+
+    cur.execute("""
+        INSERT OR REPLACE INTO news_sentiment
+        (corp_code, year, month, news_count,
+         sentiment_avg, negative_ratio, positive_ratio,
+         news_bankruptcy_flag, news_lawsuit_flag, news_ceo_change_flag)
+        SELECT
+            n.corp_code,
+            CAST(SUBSTR(s.pub_date, 1, 4) AS INTEGER) as year,
+            CAST(SUBSTR(s.pub_date, 6, 2) AS INTEGER) as month,
+            COUNT(*)                          as news_count,
+            AVG(s.positive - s.negative)      as sentiment_avg,
+            AVG(CASE WHEN s.sentiment='negative' THEN 1.0 ELSE 0.0 END) as negative_ratio,
+            AVG(CASE WHEN s.sentiment='positive' THEN 1.0 ELSE 0.0 END) as positive_ratio,
+            MAX(CASE WHEN n.title LIKE '%파산%'
+                       OR n.title LIKE '%법정관리%'
+                       OR n.title LIKE '%워크아웃%'
+                     THEN 1 ELSE 0 END)       as news_bankruptcy_flag,
+            MAX(CASE WHEN n.title LIKE '%소송%'
+                       OR n.title LIKE '%분쟁%'
+                     THEN 1 ELSE 0 END)       as news_lawsuit_flag,
+            MAX(CASE WHEN n.title LIKE '%대표이사%교체%'
+                       OR n.title LIKE '%CEO%교체%'
+                     THEN 1 ELSE 0 END)       as news_ceo_change_flag
+        FROM news_sentiment_raw s
+        JOIN news_raw n ON s.rowid_ref = n.rowid
+        WHERE s.pub_date IS NOT NULL
+        AND LENGTH(s.pub_date) >= 7
+        GROUP BY n.corp_code,
+                 SUBSTR(s.pub_date, 1, 4),
+                 SUBSTR(s.pub_date, 6, 2)
+    """)
+
+    conn.commit()
+
+    total = conn.execute("SELECT COUNT(*) FROM news_sentiment").fetchone()[0]
+    corps = conn.execute("SELECT COUNT(DISTINCT corp_code) FROM news_sentiment").fetchone()[0]
+    print(f"집계 완료: {corps}개 기업 / {total}개 월별 레코드")
+
+    # 샘플 확인
+    sample = conn.execute("""
+        SELECT corp_code, year, month, news_count,
+               ROUND(sentiment_avg, 3), ROUND(negative_ratio, 3)
+        FROM news_sentiment
+        ORDER BY year DESC, month DESC
+        LIMIT 5
+    """).fetchall()
+    print("\n=== 샘플 ===")
+    for r in sample:
+        print(f"  기업: {r[0]} | {r[1]}년 {r[2]}월 | "
+              f"뉴스: {r[3]}건 | 감성: {r[4]} | 부정비율: {r[5]}")
+
+    conn.close()
+    print("\n완료. financials 테이블과 결합 가능한 상태.")
+
+
+# ── 메인 ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("=" * 50)
+    print("KoBERT 감성 분석")
+    print("=" * 50)
+
+    # 1. 감성 분석
+    process()
+
+    # 2. 월별 집계
+    aggregate()

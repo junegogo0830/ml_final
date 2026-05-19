@@ -1,0 +1,371 @@
+"""
+5단계: financial_raw → financials 재무비율 계산
+실행: python calc_financials.py
+
+대상: K(코스닥) + Y(코스피) 기업 중 3년치 이상 보유
+출력: bankruptcy_prediction.db의 financials 테이블
+예상 시간: 10~20분
+"""
+
+import sqlite3
+import pandas as pd
+import numpy as np
+
+DB_PATH = "db/bankruptcy_prediction.db"
+
+
+# ── 1. 계정과목 추출 함수 ─────────────────────────────────────────────
+def get_amount(df, keywords, default=np.nan):
+    """
+    계정과목명에서 키워드로 금액 추출
+    여러 키워드 중 첫 번째 매칭된 값 반환
+    """
+    for kw in keywords:
+        matched = df[df['account_nm'].str.contains(kw, na=False)]
+        if len(matched) > 0:
+            val = matched.iloc[0]['thstrm_amount']
+            try:
+                # 쉼표 제거 후 숫자 변환 (단위: 원)
+                return float(str(val).replace(',', '').replace(' ', ''))
+            except:
+                continue
+    return default
+
+
+# ── 2. 재무비율 계산 함수 ─────────────────────────────────────────────
+def calc_ratios(raw_df):
+    """
+    financial_raw 데이터 → 재무비율 딕셔너리 반환
+    """
+    r = {}
+
+    # ── 원본 수치 추출 (단위: 원) ──
+    r['total_assets']       = get_amount(raw_df, ['자산총계'])
+    r['total_debt']         = get_amount(raw_df, ['부채총계'])
+    r['total_equity']       = get_amount(raw_df, ['자본총계', '자기자본'])
+    r['revenue']            = get_amount(raw_df, ['매출액', '영업수익'])
+    r['operating_income']   = get_amount(raw_df, ['영업이익'])
+    r['net_income']         = get_amount(raw_df, ['당기순이익'])
+    r['interest_expense']   = get_amount(raw_df, ['이자비용'])
+    r['operating_cf']       = get_amount(raw_df, ['영업활동현금흐름', '영업활동으로인한현금흐름'])
+    r['capex']              = get_amount(raw_df, ['유형자산취득', '설비투자', '자본적지출'])
+    r['current_assets']     = get_amount(raw_df, ['유동자산'])
+    r['current_liabilities']= get_amount(raw_df, ['유동부채'])
+    r['retained_earnings']  = get_amount(raw_df, ['이익잉여금'])
+    r['ebit']               = get_amount(raw_df, ['영업이익'])  # EBIT ≈ 영업이익
+
+    # ── 안정성 비율 ──
+    # 부채비율 = 총부채 / 자기자본
+    if not np.isnan(r['total_debt']) and not np.isnan(r['total_equity']) and r['total_equity'] != 0:
+        r['debt_ratio'] = r['total_debt'] / r['total_equity']
+    else:
+        r['debt_ratio'] = np.nan
+
+    # 유동비율 = 유동자산 / 유동부채
+    if not np.isnan(r['current_assets']) and not np.isnan(r['current_liabilities']) and r['current_liabilities'] != 0:
+        r['current_ratio'] = r['current_assets'] / r['current_liabilities']
+    else:
+        r['current_ratio'] = np.nan
+
+    # 이자보상배율 = 영업이익 / 이자비용
+    if not np.isnan(r['operating_income']) and not np.isnan(r['interest_expense']) and r['interest_expense'] != 0:
+        r['interest_coverage'] = r['operating_income'] / r['interest_expense']
+    else:
+        r['interest_coverage'] = np.nan
+
+    # 순부채비율 = (총부채 - 현금) / 자기자본
+    cash = get_amount(raw_df, ['현금및현금성자산', '현금및단기금융상품'])
+    if not np.isnan(r['total_debt']) and not np.isnan(cash) and not np.isnan(r['total_equity']) and r['total_equity'] != 0:
+        r['net_debt_ratio'] = (r['total_debt'] - cash) / r['total_equity']
+    else:
+        r['net_debt_ratio'] = np.nan
+
+    # 자기자본비율 = 자기자본 / 총자산
+    if not np.isnan(r['total_equity']) and not np.isnan(r['total_assets']) and r['total_assets'] != 0:
+        r['equity_ratio'] = r['total_equity'] / r['total_assets']
+    else:
+        r['equity_ratio'] = np.nan
+
+    # ── 수익성 비율 ──
+    # ROA = 당기순이익 / 총자산
+    if not np.isnan(r['net_income']) and not np.isnan(r['total_assets']) and r['total_assets'] != 0:
+        r['roa'] = r['net_income'] / r['total_assets']
+    else:
+        r['roa'] = np.nan
+
+    # ROE = 당기순이익 / 자기자본
+    if not np.isnan(r['net_income']) and not np.isnan(r['total_equity']) and r['total_equity'] != 0:
+        r['roe'] = r['net_income'] / r['total_equity']
+    else:
+        r['roe'] = np.nan
+
+    # 영업이익률 = 영업이익 / 매출액
+    if not np.isnan(r['operating_income']) and not np.isnan(r['revenue']) and r['revenue'] != 0:
+        r['op_margin'] = r['operating_income'] / r['revenue']
+    else:
+        r['op_margin'] = np.nan
+
+    # 순이익률 = 당기순이익 / 매출액
+    if not np.isnan(r['net_income']) and not np.isnan(r['revenue']) and r['revenue'] != 0:
+        r['net_margin'] = r['net_income'] / r['revenue']
+    else:
+        r['net_margin'] = np.nan
+
+    # ── 현금흐름 비율 ──
+    # 영업CF/총부채
+    if not np.isnan(r['operating_cf']) and not np.isnan(r['total_debt']) and r['total_debt'] != 0:
+        r['cfo_to_debt'] = r['operating_cf'] / r['total_debt']
+    else:
+        r['cfo_to_debt'] = np.nan
+
+    # 잉여현금흐름 = 영업CF - CAPEX
+    if not np.isnan(r['operating_cf']) and not np.isnan(r['capex']):
+        r['fcf'] = r['operating_cf'] - abs(r['capex'])
+    else:
+        r['fcf'] = np.nan
+
+    # ── Altman Z-Score ──
+    # Z = 1.2×(운전자본/총자산) + 1.4×(이익잉여금/총자산)
+    #   + 3.3×(EBIT/총자산) + 1.0×(매출/총자산)
+    # (시가총액 변수 제외 — 비상장 기업 대응)
+    ta = r['total_assets']
+    if not np.isnan(ta) and ta != 0:
+        wc = r['current_assets'] - r['current_liabilities'] if not np.isnan(r['current_assets']) and not np.isnan(r['current_liabilities']) else np.nan
+        re = r['retained_earnings'] if not np.isnan(r['retained_earnings']) else np.nan
+        eb = r['ebit'] if not np.isnan(r['ebit']) else np.nan
+        rv = r['revenue'] if not np.isnan(r['revenue']) else np.nan
+
+        z_components = []
+        if not np.isnan(wc):  z_components.append(1.2 * wc / ta)
+        if not np.isnan(re):  z_components.append(1.4 * re / ta)
+        if not np.isnan(eb):  z_components.append(3.3 * eb / ta)
+        if not np.isnan(rv):  z_components.append(1.0 * rv / ta)
+
+        r['z_score'] = sum(z_components) if len(z_components) == 4 else np.nan
+    else:
+        r['z_score'] = np.nan
+
+    return r
+
+
+# ── 3. 이상치 처리 ────────────────────────────────────────────────────
+def clip_outliers(df, cols, lower=-10, upper=10):
+    """극단적 이상치 클리핑 (비율 변수)"""
+    for col in cols:
+        if col in df.columns:
+            df[col] = df[col].clip(lower=lower, upper=upper)
+    return df
+
+
+# ── 4. 시계열 파생변수 계산 ───────────────────────────────────────────
+def calc_temporal_features(group_df):
+    """
+    기업별 연도순 정렬 후 시계열 파생변수 계산
+    """
+    df = group_df.sort_values('year').copy()
+
+    # 이자보상배율 YoY 변화
+    df['interest_cov_yoy'] = df['interest_coverage'].diff()
+
+    # 부채비율 3년 추세 (선형 기울기)
+    def slope(series):
+        s = series.dropna()
+        if len(s) < 3:
+            return np.nan
+        x = np.arange(len(s))
+        return np.polyfit(x, s, 1)[0]
+
+    df['debt_ratio_trend'] = df['debt_ratio'].rolling(3, min_periods=3).apply(slope)
+
+    # 영업CF 변동성 (5년 표준편차/평균)
+    def cv(series):
+        s = series.dropna()
+        if len(s) < 3 or s.mean() == 0:
+            return np.nan
+        return s.std() / abs(s.mean())
+
+    df['cf_volatility'] = df['operating_cf'].rolling(5, min_periods=3).apply(cv)
+
+    # 연속 적자 횟수
+    df['consecutive_loss'] = (
+        df['net_income'] < 0
+    ).astype(int).groupby(
+        (df['net_income'] >= 0).astype(int).cumsum()
+    ).cumsum()
+
+    # 매출성장률
+    df['revenue_growth'] = df['revenue'].pct_change()
+
+    # 영업이익성장률
+    df['op_income_growth'] = df['operating_income'].pct_change()
+
+    # 자산성장률
+    df['asset_growth'] = df['total_assets'].pct_change()
+
+    return df
+
+
+# ── 5. 메인 실행 ─────────────────────────────────────────────────────
+def main():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    # 대상 기업 조회 (K+Y, 3년치 이상)
+    target_corps = pd.read_sql("""
+        SELECT DISTINCT c.corp_code, c.market
+        FROM companies c
+        LEFT JOIN bankruptcy b ON c.corp_code = b.corp_code
+        JOIN (
+            SELECT corp_code, COUNT(DISTINCT year) as cnt
+            FROM financial_raw
+            GROUP BY corp_code
+            HAVING cnt >= 3
+        ) f ON c.corp_code = f.corp_code
+        WHERE c.market IN ('K', 'Y')
+    """, conn)
+
+    # 파산 기업도 추가 (시장 구분 무관)
+    bankrupt_corps = pd.read_sql("""
+        SELECT DISTINCT b.corp_code, c.market
+        FROM bankruptcy b
+        JOIN companies c ON b.corp_code = c.corp_code
+        JOIN (
+            SELECT corp_code, COUNT(DISTINCT year) as cnt
+            FROM financial_raw
+            GROUP BY corp_code
+            HAVING cnt >= 3
+        ) f ON b.corp_code = f.corp_code
+    """, conn)
+
+    all_corps = pd.concat([target_corps, bankrupt_corps]).drop_duplicates('corp_code')
+    print(f"처리 대상 기업: {len(all_corps)}개")
+
+    # financials 테이블 초기화
+    cur.execute("DELETE FROM financials")
+    conn.commit()
+
+    all_ratios = []
+    processed = 0
+
+    for _, row in all_corps.iterrows():
+        corp_code = row['corp_code']
+
+        # 해당 기업 전체 연도 raw 데이터 로드
+        raw = pd.read_sql(f"""
+            SELECT year, account_nm, thstrm_amount
+            FROM financial_raw
+            WHERE corp_code = '{corp_code}'
+            ORDER BY year
+        """, conn)
+
+        if raw.empty:
+            continue
+
+        yearly_ratios = []
+
+        for year in raw['year'].unique():
+            year_df = raw[raw['year'] == year].copy()
+            ratios = calc_ratios(year_df)
+            ratios['corp_code'] = corp_code
+            ratios['year'] = year
+            yearly_ratios.append(ratios)
+
+        if not yearly_ratios:
+            continue
+
+        # 시계열 파생변수 계산
+        corp_df = pd.DataFrame(yearly_ratios)
+        corp_df = calc_temporal_features(corp_df)
+        all_ratios.append(corp_df)
+
+        processed += 1
+        if processed % 100 == 0:
+            print(f"  처리중: {processed}/{len(all_corps)} ({processed/len(all_corps)*100:.1f}%)")
+
+    # 전체 합치기
+    print("\n데이터 정리 중...")
+    final_df = pd.concat(all_ratios, ignore_index=True)
+
+    # 이상치 처리
+    ratio_cols = ['debt_ratio', 'current_ratio', 'interest_coverage',
+                  'net_debt_ratio', 'equity_ratio', 'roa', 'roe',
+                  'op_margin', 'net_margin', 'cfo_to_debt',
+                  'revenue_growth', 'op_income_growth', 'asset_growth']
+    final_df = clip_outliers(final_df, ratio_cols)
+
+    # 원본 수치 억원 단위로 변환
+    amount_cols = ['total_assets', 'total_debt', 'total_equity', 'revenue',
+                   'operating_income', 'net_income', 'interest_expense',
+                   'operating_cf', 'capex', 'current_assets',
+                   'current_liabilities', 'retained_earnings', 'ebit', 'fcf']
+    for col in amount_cols:
+        if col in final_df.columns:
+            final_df[col] = final_df[col] / 1e8  # 원 → 억원
+
+    # DB INSERT
+    print("DB INSERT 중...")
+    cols = [
+        'corp_code', 'year',
+        'total_assets', 'total_debt', 'total_equity', 'revenue',
+        'operating_income', 'net_income', 'interest_expense',
+        'operating_cf', 'capex', 'current_assets', 'current_liabilities',
+        'retained_earnings', 'ebit',
+        'debt_ratio', 'current_ratio', 'interest_coverage',
+        'net_debt_ratio', 'equity_ratio',
+        'roa', 'roe', 'op_margin', 'net_margin',
+        'cfo_to_debt', 'fcf',
+        'revenue_growth', 'op_income_growth', 'asset_growth',
+        'interest_cov_yoy', 'debt_ratio_trend', 'cf_volatility',
+        'consecutive_loss', 'z_score'
+    ]
+
+    # 컬럼 존재 확인 후 필터링
+    available_cols = [c for c in cols if c in final_df.columns]
+    insert_df = final_df[available_cols].copy()
+
+    # NaN → None 변환
+    insert_df = insert_df.where(pd.notna(insert_df), None)
+
+    insert_df.to_sql('financials', conn, if_exists='append', index=False)
+    conn.commit()
+
+    # 결과 확인
+    result = pd.read_sql("""
+        SELECT 
+            COUNT(*) as 전체행수,
+            COUNT(DISTINCT corp_code) as 기업수,
+            COUNT(DISTINCT year) as 연도수,
+            AVG(debt_ratio) as 평균부채비율,
+            AVG(roa) as 평균ROA,
+            AVG(z_score) as 평균Z스코어
+        FROM financials
+    """, conn)
+
+    print("\n=== 재무비율 계산 완료 ===")
+    print(result.to_string())
+
+    # 파산/정상 기업 Z-Score 비교
+    print("\n=== 파산 vs 정상 기업 평균 비교 ===")
+    comparison = pd.read_sql("""
+        SELECT 
+            CASE WHEN b.corp_code IS NOT NULL THEN '파산' ELSE '정상' END as 구분,
+            COUNT(DISTINCT f.corp_code) as 기업수,
+            ROUND(AVG(f.debt_ratio), 2) as 평균부채비율,
+            ROUND(AVG(f.interest_coverage), 2) as 평균이자보상배율,
+            ROUND(AVG(f.roa), 4) as 평균ROA,
+            ROUND(AVG(f.z_score), 2) as 평균Z스코어
+        FROM financials f
+        LEFT JOIN bankruptcy b ON f.corp_code = b.corp_code
+        GROUP BY 구분
+    """, conn)
+    print(comparison.to_string())
+
+    conn.close()
+    print("\n완료. 다음 단계: CTGAN 증강 (06_ctgan_augment.py)")
+
+
+if __name__ == "__main__":
+    print("=" * 50)
+    print("5단계: 재무비율 계산")
+    print("=" * 50)
+    main()

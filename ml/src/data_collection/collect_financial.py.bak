@@ -1,0 +1,196 @@
+"""
+4단계: DART API → financial_raw 테이블 수집
+실행: python collect_financials.py
+
+설정:
+  딜레이 0.4초, 순차 처리 (안정 최우선)
+  예상 시간: 5~6시간
+  중간에 꺼져도 재시작하면 이어서 수집
+
+사전 조건:
+  - 3단계 완료 (companies 테이블 채워진 상태)
+  - API_KEY 입력
+"""
+
+import sqlite3
+import requests
+import time
+import json
+from datetime import datetime
+
+DB_PATH = "bankruptcy_prediction.db"
+API_KEY = "926f5be1959376e863235e6be6868be04c55b1eb"   # ← 수정 필수
+
+# 수집 연도 범위
+START_YEAR = 2010
+END_YEAR   = 2023
+
+# API 딜레이 (초) — 안정성 최우선
+DELAY = 0.4
+
+# 재무제표 구분
+FS_DIV      = "CFS"    # 연결재무제표 우선
+FS_DIV_ALT  = "OFS"    # 연결 없으면 별도재무제표
+REPORT_CODE = "11011"  # 사업보고서 (연간)
+
+
+# ── 1. 단일 기업·연도 재무제표 수집 ──────────────────────────────────
+def fetch_financial(corp_code, year, fs_div):
+    url = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
+    params = {
+        "crtfc_key":  API_KEY,
+        "corp_code":  corp_code,
+        "bsns_year":  str(year),
+        "reprt_code": REPORT_CODE,
+        "fs_div":     fs_div,
+    }
+    try:
+        res = requests.get(url, params=params, timeout=15)
+        return res.json()
+    except Exception as e:
+        return {"status": "ERR", "message": str(e)}
+
+
+# ── 2. DB INSERT ──────────────────────────────────────────────────────
+def insert_raw(cur, corp_code, year, fs_div, data_list):
+    rows = []
+    for item in data_list:
+        rows.append((
+            corp_code,
+            item.get("corp_name", ""),
+            year,
+            REPORT_CODE,
+            fs_div,
+            item.get("sj_div", ""),       # BS/IS/CF 구분
+            item.get("sj_nm", ""),        # 재무제표명
+            item.get("account_nm", ""),   # 계정과목명
+            item.get("account_id", ""),   # IFRS ID
+            item.get("thstrm_amount", ""),  # 당기 금액
+            item.get("frmtrm_amount", ""),  # 전기 금액
+            item.get("currency", "KRW"),
+        ))
+
+    cur.executemany("""
+        INSERT OR IGNORE INTO financial_raw
+        (corp_code, corp_name, year, report_code, fs_div,
+         sj_div, sj_nm, account_nm, account_id,
+         thstrm_amount, frmtrm_amount, currency)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, rows)
+
+
+def log_result(cur, corp_code, year, status, message=""):
+    cur.execute("""
+        INSERT OR REPLACE INTO collection_log
+        (corp_code, year, status, error_message, collected_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (corp_code, year, status, message[:200],
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+
+# ── 3. 이미 수집된 항목 확인 ─────────────────────────────────────────
+def get_collected(cur):
+    cur.execute("""
+        SELECT corp_code, year FROM collection_log
+        WHERE status IN ('SUCCESS', 'NO_DATA')
+    """)
+    return set((r[0], r[1]) for r in cur.fetchall())
+
+
+# ── 4. 메인 수집 루프 ────────────────────────────────────────────────
+def collect():
+    conn = sqlite3.connect(DB_PATH)
+    cur  = conn.cursor()
+
+    # 전체 기업 목록
+    cur.execute("SELECT corp_code, corp_name FROM companies")
+    companies = cur.fetchall()
+
+    # 이미 수집된 항목 로드 (재시작 시 스킵)
+    collected = get_collected(cur)
+    print(f"기업 수: {len(companies)}개")
+    print(f"이미 수집된 항목: {len(collected)}건 (스킵)")
+
+    total_targets = len(companies) * (END_YEAR - START_YEAR + 1)
+    remaining     = total_targets - len(collected)
+    eta_min       = int(remaining * DELAY / 60)
+    eta_hr        = eta_min // 60
+
+    print(f"수집 대상: {remaining}건")
+    print(f"예상 시간: 약 {eta_hr}시간 {eta_min % 60}분")
+    print(f"시작: {datetime.now().strftime('%H:%M:%S')}\n")
+
+    success, no_data, fail = 0, 0, 0
+    commit_counter = 0
+
+    for i, (corp_code, corp_name) in enumerate(companies):
+        for year in range(START_YEAR, END_YEAR + 1):
+
+            # 이미 수집된 건 스킵
+            if (corp_code, year) in collected:
+                continue
+
+            # ── API 호출 (연결재무제표 우선) ──
+            data = fetch_financial(corp_code, year, FS_DIV)
+            time.sleep(DELAY)
+
+            if data.get("status") == "000" and data.get("list"):
+                insert_raw(cur, corp_code, year, FS_DIV, data["list"])
+                log_result(cur, corp_code, year, "SUCCESS")
+                success += 1
+
+            elif data.get("status") in ("013", "020"):
+                # 연결재무제표 없으면 별도재무제표 시도
+                data2 = fetch_financial(corp_code, year, FS_DIV_ALT)
+                time.sleep(DELAY)
+
+                if data2.get("status") == "000" and data2.get("list"):
+                    insert_raw(cur, corp_code, year, FS_DIV_ALT, data2["list"])
+                    log_result(cur, corp_code, year, "SUCCESS")
+                    success += 1
+                else:
+                    log_result(cur, corp_code, year, "NO_DATA")
+                    no_data += 1
+
+            elif data.get("status") == "ERR":
+                log_result(cur, corp_code, year, "FAIL", data.get("message", ""))
+                fail += 1
+                time.sleep(2)  # 네트워크 에러 시 추가 대기
+
+            else:
+                log_result(cur, corp_code, year, "NO_DATA", data.get("message", ""))
+                no_data += 1
+
+            commit_counter += 1
+
+            # 200건마다 커밋 + 진행 상황 출력
+            if commit_counter % 200 == 0:
+                conn.commit()
+                total_done = success + no_data + fail
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] "
+                      f"기업 {i+1}/{len(companies)} | "
+                      f"성공 {success} / 데이터없음 {no_data} / 실패 {fail} | "
+                      f"진행 {total_done}/{remaining} "
+                      f"({total_done/remaining*100:.1f}%)")
+
+    conn.commit()
+    conn.close()
+
+    print(f"\n=== 수집 완료 ===")
+    print(f"  성공:      {success}건")
+    print(f"  데이터없음: {no_data}건")
+    print(f"  실패:      {fail}건")
+    print(f"  완료: {datetime.now().strftime('%H:%M:%S')}")
+    print(f"\n다음 단계: 재무비율 계산 (05_calc_financials.py)")
+
+
+# ── 메인 ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    if API_KEY == "발급받은키":
+        print("API_KEY를 입력해주세요.")
+        exit()
+
+    print("=" * 50)
+    print("4단계: 재무제표 수집")
+    print("=" * 50)
+    collect()
