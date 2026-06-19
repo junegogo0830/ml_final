@@ -1,0 +1,26 @@
+# DB (용량 큼 — repo에 포함하지 않음. README 참고해 별도로 준비)
+db/*.db
+db/*.db-shm
+db/*.db-wal
+
+# 모델 학습 시 자동 백업되는 이전 버전
+models/saved/backup_*/
+
+# 레거시 v1 파이프라인 (정리 보관용, git 추적 제외)
+legacy/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 로그 / 런타임 상태
+*.log
+models/saved/pipeline_status.json
+
+# 로컬 설정
+.claude/settings.local.json
+
+# OS / 에디터
+.DS_Store
+.vscode/

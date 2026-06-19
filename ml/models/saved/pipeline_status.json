@@ -1,0 +1,14 @@
+{
+  "running": true,
+  "step": "fetch",
+  "message": "2026년 재무제표 수집 중 (70/2657, 성공 1 / 데이터없음 69)",
+  "started_at": "2026-06-10T09:11:10.397613",
+  "error": null,
+  "result": null,
+  "updated_at": "2026-06-10T09:12:34.552564",
+  "progress": {
+    "done": 70,
+    "total": 2657,
+    "year": 2026
+  }
+}

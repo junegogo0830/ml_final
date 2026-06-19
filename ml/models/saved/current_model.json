@@ -1,0 +1,5 @@
+{
+  "active_model": "lstm",
+  "threshold": 0.7777400016784668,
+  "note": "LSTM (양방향 + 어텐션)"
+}
